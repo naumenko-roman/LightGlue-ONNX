@@ -33,7 +33,10 @@ class Extractor(StrEnum):
     def lightglue_config(self) -> dict[str, Any]:
         match self:
             case Extractor.superpoint:
-                return {"url": "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_lightglue.pth"}
+                return {
+                    "input_dim": 256,
+                    "url": "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_lightglue.pth"
+                }
             case Extractor.disk:
                 return {
                     "input_dim": 128,
