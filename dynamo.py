@@ -44,6 +44,13 @@ def export(
             help="Fuse multi-head attention subgraph into one optimized operation. (ONNX Runtime-only).",
         ),
     ] = False,
+    matcher_only: Annotated[
+        bool,
+        typer.Option(
+            "--matcher-only",
+            help="Export only the LightGlue matcher without the feature extractor.",
+        ),
+    ] = False,
     opset: Annotated[int, typer.Option(min=16, max=20, help="ONNX opset version of exported model.")] = 17,
     fp16: Annotated[bool, typer.Option("--fp16", help="Whether to also convert to FP16.")] = False,
 ):
@@ -56,23 +63,33 @@ def export(
     from lightglue_dynamo.models import DISK, LightGlue, Pipeline, SuperPoint
     from lightglue_dynamo.ops import use_fused_multi_head_attention
 
-    match extractor_type:
-        case Extractor.superpoint:
-            extractor = SuperPoint(num_keypoints=num_keypoints)
-        case Extractor.disk:
-            extractor = DISK(num_keypoints=num_keypoints)
-    matcher = LightGlue(**extractor_type.lightglue_config)
-    pipeline = Pipeline(extractor, matcher).eval()
-
-    if output is None:
-        output = Path(f"weights/{extractor_type}_lightglue_pipeline.onnx")
+    if matcher_only:
+        model = LightGlue(**extractor_type.lightglue_config).eval()
+        if output is None:
+            output = Path(f"weights/{extractor_type}_lightglue_matcher.onnx")
+    else:
+        match extractor_type:
+            case Extractor.superpoint:
+                extractor = SuperPoint(num_keypoints=num_keypoints)
+            case Extractor.disk:
+                extractor = DISK(num_keypoints=num_keypoints)
+        matcher = LightGlue(**extractor_type.lightglue_config)
+        model = Pipeline(extractor, matcher).eval()
+        if output is None:
+            output = Path(f"weights/{extractor_type}_lightglue_pipeline.onnx")
 
     check_multiple_of(batch_size, 2)
-    check_multiple_of(height, extractor_type.input_dim_divisor)
-    check_multiple_of(width, extractor_type.input_dim_divisor)
-
-    if height > 0 and width > 0 and num_keypoints > height * width:
-        raise typer.BadParameter("num_keypoints cannot be greater than height * width.")
+    
+    if not matcher_only:
+        check_multiple_of(height, extractor_type.input_dim_divisor)
+        check_multiple_of(width, extractor_type.input_dim_divisor)
+        
+        if height > 0 and width > 0 and num_keypoints > height * width:
+            raise typer.BadParameter("num_keypoints cannot be greater than height * width.")
+    else:
+        # For matcher-only, height and width parameters are not relevant
+        if height != 0 or width != 0:
+            typer.echo("Warning: height and width parameters are ignored when exporting matcher-only model.")
 
     if fuse_multi_head_attention:
         typer.echo(
@@ -82,24 +99,50 @@ def export(
             raise typer.Abort("Fused multi-head attention requires PyTorch 2.4 or later.")
         use_fused_multi_head_attention()
 
-    dynamic_axes = {"images": {}, "keypoints": {}}
-    if batch_size == 0:
-        dynamic_axes["images"][0] = "batch_size"
-        dynamic_axes["keypoints"][0] = "batch_size"
-    if height == 0:
-        dynamic_axes["images"][2] = "height"
-    if width == 0:
-        dynamic_axes["images"][3] = "width"
-    dynamic_axes |= {"matches": {0: "num_matches"}, "mscores": {0: "num_matches"}}
-    torch.onnx.export(
-        pipeline,
-        torch.zeros(batch_size or 2, extractor_type.input_channels, height or 256, width or 256),
-        str(output),
-        input_names=["images"],
-        output_names=["keypoints", "matches", "mscores"],
-        opset_version=opset,
-        dynamic_axes=dynamic_axes,
-    )
+    if matcher_only:
+        # For matcher-only export, inputs are keypoints and descriptors
+        dynamic_axes = {"keypoints": {}, "descriptors": {}}
+        if batch_size == 0:
+            dynamic_axes["keypoints"][0] = "batch_size_x2"  # 2B for pairs
+            dynamic_axes["descriptors"][0] = "batch_size_x2"
+        dynamic_axes["keypoints"][1] = "num_keypoints"
+        dynamic_axes["descriptors"][1] = "num_keypoints"
+        dynamic_axes |= {"matches": {0: "num_matches"}, "mscores": {0: "num_matches"}}
+        
+        # Create dummy inputs for matcher (2B, N, 2) and (2B, N, D)
+        dummy_keypoints = torch.zeros((batch_size or 2) * 2, num_keypoints, 2)
+        dummy_descriptors = torch.zeros((batch_size or 2) * 2, num_keypoints, extractor_type.lightglue_config["input_dim"])
+        
+        torch.onnx.export(
+            model,
+            (dummy_keypoints, dummy_descriptors),
+            str(output),
+            input_names=["keypoints", "descriptors"],
+            output_names=["matches", "mscores"],
+            opset_version=opset,
+            dynamic_axes=dynamic_axes,
+        )
+    else:
+        # For full pipeline export, input is images
+        dynamic_axes = {"images": {}, "keypoints": {}}
+        if batch_size == 0:
+            dynamic_axes["images"][0] = "batch_size"
+            dynamic_axes["keypoints"][0] = "batch_size"
+        if height == 0:
+            dynamic_axes["images"][2] = "height"
+        if width == 0:
+            dynamic_axes["images"][3] = "width"
+        dynamic_axes |= {"matches": {0: "num_matches"}, "mscores": {0: "num_matches"}}
+        
+        torch.onnx.export(
+            model,
+            torch.zeros(batch_size or 2, extractor_type.input_channels, height or 256, width or 256),
+            str(output),
+            input_names=["images"],
+            output_names=["keypoints", "matches", "mscores"],
+            opset_version=opset,
+            dynamic_axes=dynamic_axes,
+        )
     onnx.checker.check_model(output)
     onnx.save_model(SymbolicShapeInference.infer_shapes(onnx.load_model(output), auto_merge=True), output)  # type: ignore
     typer.echo(f"Successfully exported model to {output}")
