@@ -78,9 +78,9 @@ def export(
         if output is None:
             output = Path(f"weights/{extractor_type}_lightglue_pipeline.onnx")
 
-    check_multiple_of(batch_size, 2)
     
     if not matcher_only:
+        check_multiple_of(batch_size, 2)
         check_multiple_of(height, extractor_type.input_dim_divisor)
         check_multiple_of(width, extractor_type.input_dim_divisor)
         
@@ -120,7 +120,7 @@ def export(
             input_names=["keypoints", "descriptors"],
             output_names=["matches", "mscores"],
             opset_version=opset,
-            dynamic_axes=dynamic_axes,
+            #dynamic_axes=dynamic_axes,
         )
     else:
         # For full pipeline export, input is images
