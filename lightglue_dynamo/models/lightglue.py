@@ -20,7 +20,7 @@ class LearnableFourierPositionalEncoding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """encode position vector"""
         projected = self.Wr(x)
-        cosines, sines = torch.cos(projected), torch.sin(projected)
+        cosines, sines = torch.sin(projected + torch.pi/2), torch.sin(projected)
         emb = torch.stack([cosines, sines])
         return emb.repeat_interleave(2, dim=3).repeat(1, 1, 1, self.num_heads).unsqueeze(4)
 
