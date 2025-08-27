@@ -59,10 +59,11 @@ Pass `--help` to see the available options for each command. The CLI will export
 <details>
 <summary>🔥 ONNX Export</summary>
 <pre>
-python dynamo.py export superpoint \
-  --num-keypoints 1024 \
-  -b 2 -h 1024 -w 1024 \
-  -o weights/superpoint_lightglue_pipeline.onnx
+python3 dynamo.py export superpoint \
+  --num-keypoints 4096 \
+  -b 1 -h 512 -w 512 \
+  -o weights/test.onnx \
+  --matcher-only
 </pre>
 </details>
 

@@ -60,11 +60,11 @@ def export(
     from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference
     from onnxruntime.transformers.float16 import convert_float_to_float16
 
-    from lightglue_dynamo.models import DISK, LightGlue, Pipeline, SuperPoint
+    from lightglue_dynamo.models import DISK, LightGlue, LightGlueTIDL, Pipeline, SuperPoint
     from lightglue_dynamo.ops import use_fused_multi_head_attention
 
     if matcher_only:
-        model = LightGlue(**extractor_type.lightglue_config).eval()
+        model = LightGlueTIDL(**extractor_type.lightglue_config).eval()
         if output is None:
             output = Path(f"weights/{extractor_type}_lightglue_matcher.onnx")
     else:
@@ -111,15 +111,19 @@ def export(
         dynamic_axes |= {"matches": {0: "num_matches"}, "mscores": {0: "num_matches"}}
         
         # Create dummy inputs for matcher (2B, N, 2) and (2B, N, D)
-        dummy_keypoints = torch.zeros((batch_size or 2) * 2, num_keypoints, 2)
-        dummy_descriptors = torch.zeros((batch_size or 2) * 2, num_keypoints, extractor_type.lightglue_config["input_dim"])
-        
+
+        keypoints = torch.randn(2, num_keypoints, 2)
+        keypoints0, keypoints1 = keypoints[0], keypoints[1]
+
+        descriptors = torch.randn(2, num_keypoints, extractor_type.lightglue_config["input_dim"])
+        descriptors0, descriptors1 = descriptors[0], descriptors[1]
         torch.onnx.export(
             model,
-            (dummy_keypoints, dummy_descriptors),
+            (keypoints0, keypoints1, descriptors0, descriptors1),
             str(output),
-            input_names=["keypoints", "descriptors"],
-            output_names=["matches", "mscores"],
+            input_names=["keypoints0", "keypoints1", "descriptors0", "descriptors1"],
+            # output_names=["matches", "mscores"],
+            output_names=["descriptors0", "descriptors1"],
             opset_version=opset,
             #dynamic_axes=dynamic_axes,
         )

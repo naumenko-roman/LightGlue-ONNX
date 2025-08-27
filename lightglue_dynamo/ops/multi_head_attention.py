@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch.onnx import symbolic_helper
 
+MULTI_HEAD_ATTENTION_TIDL = False
 FUSE_MULTI_HEAD_ATTENTION = False
 CUSTOM_OP_NAME = "fabiosim::multi_head_attention"
 
@@ -12,12 +13,19 @@ def multi_head_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_
     q, k, v = (t.reshape((b, n, num_heads, head_dim)).transpose(1, 2) for t in (q, k, v))
     return F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape((b, n, d))
 
+def multi_head_attention_tidl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int) -> torch.Tensor:
+    n, d = q.shape
+    head_dim = d // num_heads
+    q, k, v = (t.reshape((n, num_heads, head_dim)).transpose(0, 1) for t in (q, k, v))
+    return F.scaled_dot_product_attention(q, k, v).transpose(0, 1).reshape((n, d))
 
 fused_multi_head_attention = None
 
 
 def multi_head_attention_dispatch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int) -> torch.Tensor:
-    if FUSE_MULTI_HEAD_ATTENTION and fused_multi_head_attention is not None:
+    if MULTI_HEAD_ATTENTION_TIDL:
+        return multi_head_attention_tidl(q, k, v, num_heads)
+    elif FUSE_MULTI_HEAD_ATTENTION and fused_multi_head_attention is not None:
         return fused_multi_head_attention(q, k, v, num_heads)
     else:
         return multi_head_attention(q, k, v, num_heads)

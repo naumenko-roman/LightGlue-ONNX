@@ -13,8 +13,8 @@ class LearnableFourierPositionalEncoding(nn.Module):
         print(f"LearnableFourierPositionalEncoding: M={M}, descriptor_dim={descriptor_dim}, num_heads={num_heads}, gamma={gamma}")
         super().__init__()
         self.num_heads = num_heads
-        head_dim = descriptor_dim // num_heads
-        self.Wr = nn.Linear(M, head_dim // 2, bias=False)
+        self.head_dim = descriptor_dim // num_heads
+        self.Wr = nn.Linear(M, self.head_dim // 2, bias=False)
         self.gamma = gamma
         nn.init.normal_(self.Wr.weight.data, mean=0, std=self.gamma**-2)
 
@@ -25,19 +25,22 @@ class LearnableFourierPositionalEncoding(nn.Module):
         emb = torch.stack([cosines, sines])
         return emb.repeat_interleave(2, dim=3).repeat(1, 1, 1, self.num_heads).unsqueeze(4)
 
-class SimlifiedPositionalEncoding(LearnableFourierPositionalEncoding):
+class LearnableFourierPositionalEncodingTIDL(LearnableFourierPositionalEncoding):
     def __init__(self, M: int = 2, descriptor_dim: int = 256, num_heads: int = 4, gamma: float = 1.0) -> None:
         super().__init__(M, descriptor_dim, num_heads, gamma)
-        self.interleaved_indices = [i for i in range(32) for _ in range(2)]
+        self.interleaved_indices = [i for i in range(self.head_dim // 2) for _ in range(2)]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        #TODO: fix hardcoded sizes
         """encode position vector"""
         projected = self.Wr(x)
         cosines, sines = torch.sin(projected + torch.pi/2), torch.sin(projected)
         emb = torch.stack([cosines, sines])
-        interleaved_emb = emb[:, :, :, self.interleaved_indices]
+        emb = emb.reshape((2 * 4096, 32))
+        interleaved_emb = emb[:, self.interleaved_indices]
         repeated = torch.cat([interleaved_emb] * self.num_heads, dim=-1)
-        return repeated.unsqueeze(4)
+        repeated = repeated.reshape(2, 4096, 256)
+        return repeated.unsqueeze(-1)
 
 
 class TokenConfidence(nn.Module):
@@ -52,9 +55,15 @@ class TokenConfidence(nn.Module):
             self.token(desc1.detach()).squeeze(-1),
         )
 
+def multi_head_attention_tidl(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int) -> torch.Tensor:
+    n, d = q.shape
+    head_dim = d // num_heads
+    q, k, v = (t.reshape((n, num_heads, head_dim)).transpose(0, 1) for t in (q, k, v))
+    return F.scaled_dot_product_attention(q, k, v).transpose(0, 1).reshape((n, d))
 
 class SelfBlock(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int, bias: bool = True) -> None:
+        print(f"SelfBlock: embed_dim={embed_dim}, num_heads={num_heads}, bias={bias}")
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -89,9 +98,38 @@ class SelfBlock(nn.Module):
     def apply_cached_rotary_emb(self, encoding: torch.Tensor, qk: torch.Tensor) -> torch.Tensor:
         return qk * encoding[0] + self.rotate_half(qk) * encoding[1]
 
+class SelfBlockTIDL(SelfBlock):
+    def __init__(self, embed_dim: int, num_heads: int, bias: bool = True) -> None:
+        super().__init__(embed_dim, num_heads, bias)
+
+    def rotate_half(self, qk: torch.Tensor) -> torch.Tensor:
+        n, _, _ = qk.shape
+        qk = qk.reshape((n, self.num_heads * self.head_dim // 2, 2, 2))
+        qk = torch.stack((-qk[..., 1, :], qk[..., 0, :]), dim=-2)
+        qk = qk.reshape((n, self.embed_dim, 2))
+        return qk
+
+    def apply_cached_rotary_emb(self, encoding: torch.Tensor, qk: torch.Tensor) -> torch.Tensor:
+        encoding0, encoding1 = encoding.split(1, dim=0)
+        encoding0 = encoding0.squeeze(0)
+        encoding1 = encoding1.squeeze(0)
+        return qk * encoding0 + self.rotate_half(qk) * encoding1
+
+    def forward(self, x: torch.Tensor, encoding: torch.Tensor) -> torch.Tensor:
+        n, _ = x.shape
+        qkv: torch.Tensor = self.Wqkv(x)
+        qkv = qkv.reshape((n, self.embed_dim, 3))
+        qk, v = qkv[..., :2], qkv[..., 2]
+        qk = self.apply_cached_rotary_emb(encoding, qk)
+        q, k = qk[..., 0], qk[..., 1]
+        context = multi_head_attention_tidl(q, k, v, self.num_heads)
+        message = self.out_proj(context)
+        return x + self.ffn(torch.concat([x, message], -1))
+
 
 class CrossBlock(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int, bias: bool = True) -> None:
+        print(f"CrossBlock: embed_dim={embed_dim}, num_heads={num_heads}, bias={bias}")
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -117,6 +155,19 @@ class CrossBlock(nn.Module):
         descriptors = descriptors + self.ffn(torch.concat([descriptors, m], 2))
         return descriptors
 
+class CrossBlockTIDL(CrossBlock):
+    def __init__(self, embed_dim: int, num_heads: int, bias: bool = True) -> None:
+        super().__init__(embed_dim, num_heads, bias)
+
+    def forward(self, descriptors0: torch.Tensor, descriptors1: torch.Tensor) -> torch.Tensor:
+        #TODO: calculate cross attention in both ways in one go
+        qk0 = self.to_qk(descriptors0)
+        qk1, v1 = self.to_qk(descriptors1), self.to_v(descriptors1)
+        m = multi_head_attention_tidl(qk0, qk1, v1, self.num_heads)
+        m = self.to_out(m)
+        descriptors0 = descriptors0 + self.ffn(torch.concat([descriptors0, m], -1))
+        return descriptors0
+
 
 class TransformerLayer(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int):
@@ -127,6 +178,20 @@ class TransformerLayer(nn.Module):
     def forward(self, descriptors: torch.Tensor, encodings: torch.Tensor) -> torch.Tensor:
         descriptors = self.self_attn(descriptors, encodings)
         return self.cross_attn(descriptors)
+
+class TransformerLayerTIDL(TransformerLayer):
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__(embed_dim, num_heads)
+        self.self_attn = SelfBlockTIDL(embed_dim, num_heads)
+        self.cross_attn = CrossBlockTIDL(embed_dim, num_heads)
+
+    def forward(self, descriptors0: torch.Tensor, descriptors1: torch.Tensor, encodings0: torch.Tensor, encodings1: torch.Tensor) -> torch.Tensor:
+        descriptors0 = self.self_attn(descriptors0, encodings0)
+        descriptors1 = self.self_attn(descriptors1, encodings1)
+        m0 = self.cross_attn(descriptors0, descriptors1)
+        m1 = self.cross_attn(descriptors1, descriptors0)
+        return m0, m1
+
 
 
 def sigmoid_log_double_softmax(similarities: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -201,7 +266,6 @@ class LightGlue(nn.Module):
         else:
             self.input_proj = nn.Identity()
 
-        # self.posenc = SimlifiedPositionalEncoding(2, self.descriptor_dim, self.num_heads)
         self.posenc = LearnableFourierPositionalEncoding(2, self.descriptor_dim, self.num_heads)
 
         d, h, n = self.descriptor_dim, self.num_heads, self.n_layers
@@ -231,8 +295,8 @@ class LightGlue(nn.Module):
         keypoints: torch.Tensor,  # (2B, N, 2), normalized
         descriptors: torch.Tensor,  # (2B, N, D)
     ):
-        print(f"LightGlue.forward(): keypoints.shape={keypoints.shape}, descriptors.shape={descriptors.shape}")
         descriptors = self.input_proj(descriptors)
+
         # positional embeddings
         encodings = self.posenc(keypoints)  # (2, 2B, *, 64, 1)
 
@@ -274,3 +338,42 @@ class LightGlue(nn.Module):
         threshold = self.confidence_thresholds[layer_index]
         ratio_confident = 1.0 - (confidences < threshold).float().sum() / num_points
         return ratio_confident > self.depth_confidence
+
+class LightGlueTIDL(LightGlue):
+    def __init__(
+        self,
+        url: str,
+        input_dim: int = 256,
+        descriptor_dim: int = 256,
+        num_heads: int = 4,
+        n_layers: int = 9,
+        filter_threshold: float = 0.1,
+        depth_confidence: float = -1,
+        width_confidence: float = -1,
+    ) -> None:
+        super().__init__(url, input_dim, descriptor_dim, num_heads, n_layers, filter_threshold, depth_confidence, width_confidence)
+
+        if input_dim != self.descriptor_dim:
+            self.input_proj = nn.Linear(input_dim, self.descriptor_dim, bias=True)
+        else:
+            self.input_proj = nn.Identity()
+
+        # self.posenc = SimlifiedPositionalEncoding(2, self.descriptor_dim, self.num_heads)
+        self.posenc = LearnableFourierPositionalEncodingTIDL(2, self.descriptor_dim, self.num_heads)
+
+        d, h, n = self.descriptor_dim, self.num_heads, self.n_layers
+
+        self.transformers = nn.ModuleList([TransformerLayerTIDL(d, h) for _ in range(n)])
+
+    def forward(self, keypoints0: torch.Tensor, keypoints1: torch.Tensor, descriptors0: torch.Tensor, descriptors1: torch.Tensor):
+        descriptors0 = self.input_proj(descriptors0)
+        descriptors1 = self.input_proj(descriptors1)
+
+        encodings0 = self.posenc(keypoints0)
+        encodings1 = self.posenc(keypoints1)
+
+        for i in range(self.n_layers):
+            descriptors0, descriptors1 = self.transformers[i](descriptors0, descriptors1, encodings0, encodings1)
+        
+
+        return descriptors0, descriptors1
